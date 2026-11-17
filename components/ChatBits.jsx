@@ -331,3 +331,99 @@ export function ImageViewer({ src, caption, onClose }) {
     </>
   );
 }
+
+/* ---------- drag & drop media (WhatsApp-style) ---------- */
+export const MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 50 * 1024 * 1024 };
+
+/* FileList -> { items: [{kind, file}], error } — skips non image/video files
+   and collects a ready-to-show error for oversize/wrong types */
+export function splitMedia(files) {
+  const items = [];
+  const errors = [];
+  for (const f of Array.from(files || [])) {
+    const kind = f.type?.startsWith("image/") ? "image" : f.type?.startsWith("video/") ? "video" : null;
+    if (!kind) {
+      errors.push(`${f.name || "File"} isn't an image or video`);
+      continue;
+    }
+    if (f.size > MEDIA_LIMITS[kind]) {
+      errors.push(`${f.name || "File"} is over ${kind === "image" ? "5" : "50"}MB`);
+      continue;
+    }
+    items.push({ kind, file: f });
+  }
+  return { items, error: errors.length ? errors.join("\n") : null };
+}
+
+const hasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes("Files");
+
+/* spread dropProps on the chat container; `dragging` drives <DropOverlay />.
+   A depth counter keeps child-element dragenter/leave noise from flickering. */
+export function useFileDrop(onFiles) {
+  const [dragging, setDragging] = useState(false);
+  const depth = useRef(0);
+  const cbRef = useRef(onFiles);
+  cbRef.current = onFiles;
+
+  useEffect(() => {
+    // a drop outside the container would otherwise navigate the browser
+    const stop = (e) => e.preventDefault();
+    window.addEventListener("dragover", stop);
+    window.addEventListener("drop", stop);
+    return () => {
+      window.removeEventListener("dragover", stop);
+      window.removeEventListener("drop", stop);
+    };
+  }, []);
+
+  const dropProps = {
+    onDragEnter: (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth.current++;
+      setDragging(true);
+    },
+    onDragOver: (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    },
+    onDragLeave: (e) => {
+      if (!hasFiles(e)) return;
+      depth.current = Math.max(0, depth.current - 1);
+      if (depth.current === 0) setDragging(false);
+    },
+    onDrop: (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth.current = 0;
+      setDragging(false);
+      if (e.dataTransfer?.files?.length) cbRef.current?.(e.dataTransfer.files);
+    },
+  };
+  return { dragging, dropProps };
+}
+
+/* pointer-events:none is required — drop events must land on the container under it */
+export function DropOverlay() {
+  return (
+    <div
+      style={{
+        position: "fixed", inset: 0, zIndex: 5000, pointerEvents: "none",
+        background: "rgba(8,12,16,.6)", display: "flex", alignItems: "center", justifyContent: "center",
+      }}
+    >
+      <div
+        style={{
+          border: "3px dashed #ff5a2e", borderRadius: 18, padding: "44px 56px",
+          display: "flex", flexDirection: "column", alignItems: "center", gap: 10,
+          background: "rgba(0,0,0,.45)", color: "#fff", textAlign: "center",
+        }}
+      >
+        <i className="fas fa-images" style={{ fontSize: 46, color: "#ff5a2e" }} />
+        <div style={{ fontSize: 17, fontWeight: 700 }}>Drop images or videos to send</div>
+        <div style={{ fontSize: 12.5, opacity: 0.75 }}>Preview opens before sending</div>
+      </div>
+    </div>
+  );
+}

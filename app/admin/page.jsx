@@ -2,8 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CALL_CSS, CallOverlay, useVoiceCall } from "@/components/CallUI";
-import { Tick, MsgText, StickerMsg, VoicePlayer, CallEventRow, EmojiGrid, StickerPicker, ImageViewer } from "@/components/ChatBits";
-import { api, fmtTime, fmtDay, fmtAgo, sfx, isSticker, callInfo, avatarFor, subscribePush } from "@/lib/client";
+import {
+  Tick, MsgText, StickerMsg, VoicePlayer, CallEventRow,
+  EmojiGrid, StickerPicker, ImageViewer, MediaComposer,
+  MEDIA_LIMITS, splitMedia, useFileDrop, DropOverlay,
+} from "@/components/ChatBits";
+import { api, fmtTime, fmtDay, fmtAgo, sfx, isSticker, callInfo, avatarFor, subscribePush, downloadContact } from "@/lib/client";
 
 const CSS = `
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif; -webkit-tap-highlight-color:transparent; }
@@ -162,10 +166,14 @@ html, body { height:100%; overscroll-behavior:none; }
 .wa-ia-btn.emoji { color:#f39c12; }
 .wa-ia-btn.mic { color:#e74c3c; }
 .wa-ia-btn.attach { color:#3498db; }
+.wa-ia-btn.video { color:#9b59b6; }
 .wa-ia-btn.recording { background:#e74c3c; color:#fff; animation:waPulse 1s infinite; }
 @keyframes waPulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.08)} }
 .wa-rec-bar { position:fixed; bottom:76px; left:50%; transform:translateX(-50%); background:#e74c3c; color:#fff; padding:10px 20px; border-radius:24px; font-size:13px; font-weight:600; display:flex; align-items:center; gap:10px; z-index:100; }
 .wa-rec-bar .dot { width:10px; height:10px; background:#fff; border-radius:50%; animation:waPulse 1s infinite; }
+.wa-up-bar { position:fixed; bottom:76px; left:50%; transform:translateX(-50%); background:#c23a10; color:#fff; padding:10px 16px; border-radius:24px; font-size:12px; font-weight:600; z-index:100; min-width:220px; max-width:90%; }
+.wa-up-track { height:5px; background:rgba(255,255,255,0.25); border-radius:4px; margin-top:6px; overflow:hidden; }
+.wa-up-fill { height:100%; background:#ff5a2e; border-radius:4px; transition:width 0.15s linear; }
 .wa-input-wrap { flex:1 1 auto; min-width:0; background:#fff; border-radius:22px; display:flex; align-items:flex-end; padding:3px 8px; border:1px solid #ddd; }
 .wa-input-wrap:focus-within { border-color:#ff5a2e; }
 .wa-input-wrap textarea { flex:1; border:none; outline:none; resize:none; padding:8px 4px; font-size:15px; font-family:inherit; background:transparent; color:#1a1a1a; max-height:100px; line-height:1.4; min-width:0; }
@@ -187,6 +195,15 @@ html, body { height:100%; overscroll-behavior:none; }
 .wa-toast.error { background:#e74c3c; }
 .wa-toast.success { background:#27ae60; }
 .wa-toast.info { background:#4a90e2; }
+
+/* save-contact modal */
+.ct-body { padding:16px 18px 18px; display:flex; flex-direction:column; align-items:center; gap:10px; }
+.ct-av { width:76px; height:76px; border-radius:50%; object-fit:cover; background:#dfe5e8; }
+.ct-name { width:100%; padding:10px 12px; border:1px solid #ddd; border-radius:9px; font-size:14.5px; outline:none; }
+.ct-name:focus { border-color:#e13c0e; }
+.ct-num { color:#667781; font-size:14px; font-weight:600; direction:ltr; }
+.ct-body .ag-add { width:100%; display:flex; align-items:center; justify-content:center; gap:8px; }
+.ct-body .ag-add:disabled { opacity:.6; cursor:default; }
 
 @media (max-width:760px) {
   .a-side { width:100%; max-width:100%; border-right:0; }
@@ -311,12 +328,19 @@ function Console() {
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [stickerOpen, setStickerOpen] = useState(false);
   const [rec, setRec] = useState(null);
+  const [composer, setComposer] = useState(null); // {kind:'image'|'video', file, userId}
+  const [mediaQueue, setMediaQueue] = useState([]);
+  const [upload, setUpload] = useState(null); // {label, pct}
+  const [contactOpen, setContactOpen] = useState(false);
+  const [contactName, setContactName] = useState("");
+  const [contactBusy, setContactBusy] = useState(false);
 
   const selRef = useRef(null);
   selRef.current = sel;
   const mainRef = useRef(null);
   const taRef = useRef(null);
   const imgRef = useRef(null);
+  const vidRef = useRef(null);
   const typingTimer = useRef(null);
   const typingSent = useRef(0);
   const toastTimer = useRef(null);
@@ -495,14 +519,69 @@ function Console() {
     if (el) { el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 100) + "px"; }
   };
 
-  const attachImage = async (file) => {
-    if (!file || !sel) return;
+  const uploadMedia = (kind, file, caption, userId = selRef.current) => {
+    if (!file || !userId) return;
+    setUpload({ label: kind === "audio" ? "Sending voice…" : "Uploading…", pct: 0 });
     const fd = new FormData();
-    fd.append("kind", "image");
+    fd.append("kind", kind);
     fd.append("file", file);
-    fd.append("userId", String(sel));
-    const r = await fetch("/api/admin/send-media", { method: "POST", body: fd }).then((x) => x.json()).catch(() => null);
-    if (!r?.success) showToast(r?.error || "Upload failed", "error");
+    fd.append("userId", String(userId));
+    fd.append("caption", caption || "");
+    if (replyTo) fd.append("reply_to", JSON.stringify(replyTo.id));
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/admin/send-media");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) setUpload((u) => u && { ...u, pct: Math.round((e.loaded / e.total) * 96) });
+    };
+    xhr.onload = () => {
+      setUpload((u) => u && { ...u, pct: 96 });
+      try {
+        const d = JSON.parse(xhr.responseText);
+        if (d?.success) {
+          setReplyTo(null);
+          sfx.msgOut();
+          setTimeout(() => { const el = mainRef.current; if (el) el.scrollTop = el.scrollHeight; }, 30);
+        } else showToast(d?.error || "Upload failed", "error");
+      } catch {
+        showToast("Upload failed", "error");
+      }
+      setTimeout(() => setUpload(null), 300);
+    };
+    xhr.onerror = () => { setUpload(null); showToast("Upload failed", "error"); };
+    xhr.send(fd);
+  };
+
+  const pickFile = (kind, file) => {
+    if (!file || !selRef.current) return;
+    if (file.size > MEDIA_LIMITS[kind]) return showToast(kind === "image" ? "Image > 5MB" : "Video > 50MB", "error");
+    setComposer({ kind, file, userId: selRef.current });
+  };
+
+  /* ---------- drag & drop / paste ---------- */
+  const enqueueMedia = useCallback(
+    (files) => {
+      const uid = selRef.current;
+      if (!uid) return;
+      const { items, error } = splitMedia(files);
+      if (error) showToast(error, "error");
+      if (!items.length) return;
+      const tagged = items.map((it) => ({ ...it, userId: uid }));
+      if (composer) {
+        setMediaQueue((q) => [...q, ...tagged]);
+      } else {
+        setComposer(tagged[0]);
+        if (tagged.length > 1) setMediaQueue((q) => [...q, ...tagged.slice(1)]);
+      }
+    },
+    [composer, showToast]
+  );
+
+  const { dragging, dropProps } = useFileDrop(enqueueMedia);
+
+  const nextQueued = () => {
+    const [next, ...rest] = mediaQueue;
+    setMediaQueue(rest);
+    setComposer(next || null);
   };
 
   const sendSticker = async (kind, value) => {
@@ -533,11 +612,7 @@ function Console() {
       setRec(null);
       if ((Date.now() - started) / 1000 < 1 || !sel) return;
       const blob = new Blob(chunks, { type: mr.mimeType || "audio/webm" });
-      const fd = new FormData();
-      fd.append("kind", "audio");
-      fd.append("file", new File([blob], "voice.webm", { type: blob.type }));
-      fd.append("userId", String(sel));
-      await fetch("/api/admin/send-media", { method: "POST", body: fd }).catch(() => {});
+      uploadMedia("audio", new File([blob], "voice.webm", { type: blob.type }), "");
     };
     recRef.current = { mr, chunks };
     mr.start();
@@ -555,6 +630,22 @@ function Console() {
     if (!u) return;
     const r = await api("/api/admin/block", { method: "POST", body: { userId: sel, blocked: !u.blocked } });
     if (r.data?.success) setUsers((us) => us.map((x) => (x.id === sel ? { ...x, blocked: !u.blocked } : x)));
+  };
+
+  const saveContact = async () => {
+    if (!selUser || contactBusy) return;
+    const name = contactName.trim();
+    if (!name) return showToast("Name required", "error");
+    setContactBusy(true);
+    const r = await api("/api/admin/save-contact", { method: "POST", body: { userId: selUser.id, name } });
+    setContactBusy(false);
+    if (!r.data?.success) return showToast(r.data?.error || "Save failed", "error");
+    const dn = r.data.user?.display_name || name;
+    setUsers((us) => us.map((x) => (x.id === selUser.id ? { ...x, display_name: dn } : x)));
+    // also hand the agent a .vcf they can import into their phone
+    downloadContact({ name: dn, phone: `+${selUser.cc || "91"}${selUser.mobile}`, avatarSrc: avatarFor(selUser.username) });
+    showToast("Contact saved — .vcf downloaded", "success");
+    setContactOpen(false);
   };
 
   const logout = async () => {
@@ -693,7 +784,8 @@ function Console() {
               Select a customer to open their chat
             </div>
           ) : (
-            <div className="chat-root">
+            <div className="chat-root" {...dropProps}>
+              {dragging && <DropOverlay />}
               <header className="wa-header">
                 <button className="a-back2" onClick={() => { setMobileOpen(false); setSel(null); }} aria-label="Back to customers" title="Back to customers">
                   <i className="fas fa-arrow-left" />
@@ -717,6 +809,13 @@ function Console() {
                   )}
                 </div>
                 <div className="wa-actions">
+                  <button
+                    className="wa-logout"
+                    title="Save contact"
+                    onClick={() => { setContactName(selUser?.display_name || ""); setContactOpen(true); }}
+                  >
+                    <i className="fas fa-user-plus" /> Save
+                  </button>
                   <button
                     className={`wa-logout ${selUser?.blocked ? "" : ""}`}
                     style={selUser?.blocked ? { background: "#e74c3c" } : undefined}
@@ -764,6 +863,14 @@ function Console() {
                   {`Recording ${Math.floor(rec.secs / 60)}:${String(rec.secs % 60).padStart(2, "0")} — tap mic to stop`}
                 </div>
               )}
+              {upload && (
+                <div className="wa-up-bar">
+                  {upload.label} {upload.pct}%
+                  <div className="wa-up-track">
+                    <div className="wa-up-fill" style={{ width: `${upload.pct}%` }} />
+                  </div>
+                </div>
+              )}
               <div className="wa-input-bar">
                 <div className="wa-input-actions">
                   <button className="wa-ia-btn emoji" title="Emoji" onClick={() => { setStickerOpen(false); setEmojiOpen((v) => !v); }}>
@@ -778,6 +885,9 @@ function Console() {
                   <button className="wa-ia-btn attach" title="Photo" onClick={() => imgRef.current?.click()}>
                     <i className="fas fa-paperclip" />
                   </button>
+                  <button className="wa-ia-btn video" title="Video" onClick={() => vidRef.current?.click()}>
+                    <i className="fas fa-video" />
+                  </button>
                 </div>
                 <div className="wa-input-wrap">
                   <textarea
@@ -785,6 +895,10 @@ function Console() {
                     rows={1}
                     value={text}
                     onChange={(e) => onType(e.target.value)}
+                    onPaste={(e) => {
+                      const fs = e.clipboardData?.files;
+                      if (fs?.length) { e.preventDefault(); enqueueMedia(fs); }
+                    }}
                     placeholder="Type a reply..."
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -796,7 +910,8 @@ function Console() {
                   <i className={`fas ${sending ? "fa-spinner fa-spin" : "fa-paper-plane"}`} />
                 </button>
               </div>
-              <input ref={imgRef} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) attachImage(f); }} />
+              <input ref={imgRef} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) pickFile("image", f); }} />
+              <input ref={vidRef} type="file" accept="video/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) pickFile("video", f); }} />
             </div>
           )}
         </section>
@@ -821,6 +936,45 @@ function Console() {
 .wa-sheet button.cancel{color:#e74c3c;font-weight:600;border-top:1px solid #eee;margin-top:4px;justify-content:center}
 .wa-sheet button i{width:20px;text-align:center;font-size:15px;color:#666}`}</style>
       {viewer && <ImageViewer src={viewer.src} caption={viewer.caption} onClose={() => setViewer(null)} />}
+      {composer && (
+        <MediaComposer
+          kind={composer.kind}
+          file={composer.file}
+          sending={!!upload}
+          onCancel={() => { setComposer(null); setMediaQueue([]); }}
+          onSend={(caption) => {
+            const c = composer;
+            uploadMedia(c.kind, c.file, caption, c.userId);
+            nextQueued();
+          }}
+        />
+      )}
+      {contactOpen && selUser && (
+        <div className="ag-overlay" onClick={() => !contactBusy && setContactOpen(false)}>
+          <div className="ag-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="ag-head">
+              <strong>Save contact</strong>
+              <button onClick={() => setContactOpen(false)}><i className="fas fa-times" /></button>
+            </div>
+            <div className="ct-body">
+              <img className="ct-av" src={avatarFor(selUser.username)} alt="" />
+              <input
+                className="ct-name"
+                value={contactName}
+                maxLength={80}
+                onChange={(e) => setContactName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") saveContact(); }}
+                placeholder="Contact name"
+                autoFocus
+              />
+              <div className="ct-num">{`+${selUser.cc || "91"} ${selUser.mobile}`}</div>
+              <button className="ag-add" onClick={saveContact} disabled={contactBusy}>
+                <i className="fas fa-user-plus" /> {contactBusy ? "Saving…" : "Save contact"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {agentsOpen && <AgentsPanel onClose={() => setAgentsOpen(false)} />}
       {toast && <div key={toast.id} className={`wa-toast ${toast.kind}`}>{toast.msg}</div>}
 

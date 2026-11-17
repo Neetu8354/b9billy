@@ -8,6 +8,7 @@ import { CALL_CSS, CallOverlay, useVoiceCall } from "@/components/CallUI";
 import {
   Tick, MsgText, StickerMsg, VoicePlayer, CallEventRow,
   EmojiGrid, StickerPicker, MediaComposer, Sheet, ImageViewer,
+  MEDIA_LIMITS, splitMedia, useFileDrop, DropOverlay,
 } from "@/components/ChatBits";
 import {
   api, fmtTime, fmtDay, fmtAgo, sfx, isSticker, callInfo, avatarFor,
@@ -186,6 +187,7 @@ export default function ChatPage() {
   const [menuFor, setMenuFor] = useState(null);
   const [toast, setToast] = useState(null);
   const [composer, setComposer] = useState(null); // {kind:'image'|'video', file}
+  const [mediaQueue, setMediaQueue] = useState([]); // rest of a multi-file drop/paste
   const [rec, setRec] = useState(null); // {secs}
   const [upload, setUpload] = useState(null); // {label, pct}
   const [gone, setGone] = useState(false);
@@ -448,9 +450,34 @@ export default function ChatPage() {
 
   const pickFile = (kind, file) => {
     if (!file) return;
-    const limit = kind === "image" ? 5 * 1024 * 1024 : 50 * 1024 * 1024;
-    if (file.size > limit) return showToast(kind === "image" ? "Image > 5MB" : "Video > 50MB", "error");
+    if (file.size > MEDIA_LIMITS[kind]) return showToast(kind === "image" ? "Image > 5MB" : "Video > 50MB", "error");
     setComposer({ kind, file });
+  };
+
+  /* ---------- drag & drop / paste ---------- */
+  /* first file opens the composer; the rest wait in mediaQueue so each gets
+     its own caption — Cancel exits the whole queue */
+  const enqueueMedia = useCallback(
+    (files) => {
+      const { items, error } = splitMedia(files);
+      if (error) showToast(error, "error");
+      if (!items.length) return;
+      if (composer) {
+        setMediaQueue((q) => [...q, ...items]);
+      } else {
+        setComposer(items[0]);
+        if (items.length > 1) setMediaQueue((q) => [...q, ...items.slice(1)]);
+      }
+    },
+    [composer, showToast]
+  );
+
+  const { dragging, dropProps } = useFileDrop(enqueueMedia);
+
+  const nextQueued = () => {
+    const [next, ...rest] = mediaQueue;
+    setMediaQueue(rest);
+    setComposer(next || null);
   };
 
   /* ---------- voice recording ---------- */
@@ -638,7 +665,8 @@ export default function ChatPage() {
     <>
       <style>{CSS + CALL_CSS}</style>
       <VisitBeacon />
-      <div className="chat-root">
+      <div className="chat-root" {...dropProps}>
+        {dragging && <DropOverlay />}
         <header className="wa-header">
           <a className="wa-back" href="/social">
             <i className="fas fa-arrow-left" />
@@ -749,6 +777,10 @@ export default function ChatPage() {
                 rows={1}
                 value={text}
                 onChange={(e) => onType(e.target.value)}
+                onPaste={(e) => {
+                  const fs = e.clipboardData?.files;
+                  if (fs?.length) { e.preventDefault(); enqueueMedia(fs); }
+                }}
                 placeholder={editing ? "Edit message..." : "Type a message..."}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
@@ -780,11 +812,11 @@ export default function ChatPage() {
             kind={composer.kind}
             file={composer.file}
             sending={!!upload}
-            onCancel={() => setComposer(null)}
+            onCancel={() => { setComposer(null); setMediaQueue([]); }}
             onSend={(caption) => {
               const c = composer;
-              setComposer(null);
               uploadMedia(c.kind, c.file, caption);
+              nextQueued();
             }}
           />
         )}
